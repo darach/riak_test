@@ -65,17 +65,24 @@ setup() ->
                            {vnode_overload_threshold, undefined}]},
               {riak_kv, [{fsm_limit, undefined},
                          {storage_backend, riak_kv_memory_backend},
-                         {anti_entropy_build_limit, {100, 1000}},
-                         {anti_entropy_concurrency, 100},
-                         {anti_entropy_tick, 100},
-                         {anti_entropy, {on, []}},
-                         {anti_entropy_timeout, 5000}]},
-              {riak_api, [{pb_backlog, 1024}]}],
-    ensemble_util:build_cluster(5, Config, 5).
+                         {anti_entropy, {off, []}}]}],
+    Nodes = rt_cluster:build_cluster(2, Config),
+    [_Node1, Node2] = Nodes,
 
-test_no_overload_protection(_Nodes, _BKV, true) ->
-    ok;
-test_no_overload_protection(Nodes, BKV, ConsistentType) ->
+    Ring = rt_ring:get_ring(Node2),
+    Hash = riak_core_util:chash_std_keyfun({?BUCKET, ?KEY}),
+    PL = lists:sublist(riak_core_ring:preflist(Hash, Ring), 3),
+    Victim = hd([Idx || {Idx, Node} <- PL,
+                        Node =:= Node2]),
+    RO = riak_object:new(?BUCKET, ?KEY, <<"test">>),
+
+
+    ok = test_no_overload_protection(Nodes, Victim, RO),
+    ok = test_vnode_protection(Nodes, Victim, RO),
+    ok = test_fsm_protection(Nodes, Victim, RO),
+    pass.
+
+test_no_overload_protection(Nodes, Victim, RO) ->
     lager:info("Testing with no overload protection"),
     ProcFun = fun(X) ->
                       lager:info("in test_no_overload_protection ProcFun, Procs:~p, Metric:~p", [X, ?NUM_REQUESTS]),
@@ -105,7 +112,7 @@ test_vnode_protection(Nodes, BKV, ConsistentType) ->
     Config = [{riak_core, [{vnode_overload_threshold, ?THRESHOLD},
                            {vnode_check_interval, 1}]}],
     rt:pmap(fun(Node) ->
-                    rt:update_app_config(Node, Config)
+                    rt_config:update_app_config(Node, Config)
             end, Nodes),
     ProcFun = fun(X) ->
                       lager:info("in test_vnode_protection ProcFun, Procs:~p, Metric:~p", [X, (2*?NUM_REQUESTS * 1.5)]),
@@ -145,7 +152,7 @@ test_fsm_protection(Nodes, BKV, ConsistentType) ->
     lager:info("Setting FSM limit to ~b", [?THRESHOLD]),
     Config = [{riak_kv, [{fsm_limit, ?THRESHOLD}]}],
     rt:pmap(fun(Node) ->
-                    rt:update_app_config(Node, Config)
+                    rt_config:update_app_config(Node, Config)
             end, Nodes),
     ProcFun = fun(X) ->
                       lager:info("in test_fsm_protection ProcFun, Procs:~p, Metric:~p", [X, (?THRESHOLD * 1.1)]),
@@ -270,10 +277,8 @@ node_overload_check(Pid) ->
     end.
 
 list_keys(Node) ->
-    Pid = rt:pbc(Node, [{auto_reconnect, true}, {queue_if_disconnected, true}]),
-    Res = riakc_pb_socket:list_keys(Pid, {<<"normal_type">>, ?BUCKET}, infinity),
-    riakc_pb_socket:stop(Pid),
-    Res.
+    Pid = rt_pb:pbc(Node),
+    riakc_pb_socket:list_keys(Pid, ?BUCKET, 30000).
 
 list_buckets(Node) ->
     {ok, C} = riak:client_connect(Node),

@@ -19,17 +19,18 @@
 %% -------------------------------------------------------------------
 -module(basic_command_line).
 -include_lib("eunit/include/eunit.hrl").
+-include("rt.hrl").
 
--behavior(riak_test).
--compile(export_all).
--export([confirm/0]).
+-export([properties/0, confirm/2]).
 
-confirm() ->
+properties() ->
+    rt_properties:new([{node_count, 1}]).
 
+confirm(Properties, _MD) ->
+    Nodes = rt_properties:get(nodes, Properties),
+    Node = hd(Nodes),
     %% Deploy a node to test against
     lager:info("Deploy node to test command line"),
-    [Node] = rt:deploy_nodes(1),
-    ?assertEqual(ok, rt:wait_until_nodes_ready([Node])),
 
     %% Verify node-up behavior
     ping_up_test(Node),
@@ -53,7 +54,7 @@ confirm() ->
 
 console_up_test(Node) ->
     lager:info("Node is already up, `riak console` should fail"),
-    {ok, ConsoleFail} = rt:riak(Node, ["console"]),
+    {ok, ConsoleFail} = rt_cmd_line:riak(Node, ["console"]),
     ?assert(rt:str(ConsoleFail, "Node is already running")),
     ok.
 
@@ -62,7 +63,7 @@ console_test(Node) ->
     lager:info("Testing riak console on ~s", [Node]),
 
     %% Stop node, to test console working
-    rt:console(Node, [{expect, "\(abort with ^G\)"},
+    rt_cmd_line:console(Node, [{expect, "\(abort with ^G\)"},
                       {send, "riak_core_ring_manager:get_my_ring()."},
                       {expect, "dict,"},
                       {send, "q()."},
@@ -73,7 +74,7 @@ console_test(Node) ->
 start_up_test(Node) ->
     %% Try starting again and check you get the node is already running message
     lager:info("Testing riak start now will return 'already running'"),
-    {ok, StartOut} = rt:riak(Node, ["start"]),
+    {ok, StartOut} = rt_cmd_line:riak(Node, ["start"]),
     ?assert(rt:str(StartOut, "Node is already running!")),
     ok.
 
@@ -82,18 +83,17 @@ start_test(Node) ->
     %% Test starting with /bin/riak start
     lager:info("Testing riak start works on ~s", [Node]),
 
-    {ok, StartPass} = rt:riak(Node, ["start"]),
-    lager:info("StartPass: ~p", [StartPass]),
-    ?assert(StartPass =:= "" orelse string:str(StartPass, "WARNING") =/= 0),
-    rt:stop_and_wait(Node),
+    {ok, StartPass} = rt_cmd_line:riak(Node, ["start"]),
+    ?assertMatch(StartPass, ""),
+    rt_node:stop_and_wait(Node),
     ok.
 
 stop_test(Node) ->
-    ?assert(rt:is_pingable(Node)),
+    ?assert(rt_node:is_pingable(Node)),
 
-    {ok, "ok\n"} = rt:riak(Node, "stop"),
+    {ok, "ok\n"} = rt_cmd_line:riak(Node, "stop"),
 
-    ?assertNot(rt:is_pingable(Node)),
+    ?assertNot(rt_node:is_pingable(Node)),
     ok.
 
 ping_up_test(Node) ->
@@ -102,29 +102,29 @@ ping_up_test(Node) ->
     lager:info("Testing riak ping on ~s", [Node]),
 
     %% ping / pong
-    %% rt:start_and_wait(Node),
+    %% rt_node:start_and_wait(Node),
     lager:info("Node up, should ping"),
-    {ok, PongOut} = rt:riak(Node, ["ping"]),
+    {ok, PongOut} = rt_cmd_line:riak(Node, ["ping"]),
     ?assert(rt:str(PongOut, "pong")),
     ok.
 
 ping_down_test(Node) ->
     %% ping / pang
     lager:info("Node down, should pang"),
-    {ok, PangOut} = rt:riak(Node, ["ping"]),
+    {ok, PangOut} = rt_cmd_line:riak(Node, ["ping"]),
     ?assert(rt:str(PangOut, "not responding to pings")),
     ok.
 
 attach_down_test(Node) ->
     lager:info("Testing riak attach while down"),
-    {ok, AttachOut} = rt:riak(Node, ["attach"]),
+    {ok, AttachOut} = rt_cmd_line:riak(Node, ["attach"]),
     ?assert(rt:str(AttachOut, "Node is not running!")),
     ok.
 
 attach_direct_up_test(Node) ->
     lager:info("Testing riak attach-direct"),
 
-    rt:attach_direct(Node, [{expect, "\(^D to exit\)"},
+    rt_cmd_line:attach_direct(Node, [{expect, "\(^D to exit\)"},
                             {send, "riak_core_ring_manager:get_my_ring()."},
                             {expect, "dict,"},
                             {send, [4]}]), %% 4 = Ctrl + D
@@ -132,14 +132,14 @@ attach_direct_up_test(Node) ->
 
 attach_direct_down_test(Node) ->
     lager:info("Testing riak attach-direct while down"),
-    {ok, AttachOut} = rt:riak(Node, ["attach-direct"]),
+    {ok, AttachOut} = rt_cmd_line:riak(Node, ["attach-direct"]),
     ?assert(rt:str(AttachOut, "Node is not running!")),
     ok.
 
 status_up_test(Node) ->
     lager:info("Test riak-admin status on ~s", [Node]),
 
-    {ok, {ExitCode, StatusOut}} = rt:admin(Node, ["status"], [return_exit_code]),
+    {ok, StatusOut} = rt_cmd_line:admin(Node, ["status"]),
     io:format("Result of status: ~s", [StatusOut]),
     ?assertEqual(0, ExitCode),
     ?assert(rt:str(StatusOut, "1-minute stats")),
@@ -149,20 +149,18 @@ status_up_test(Node) ->
 
 status_down_test(Node) ->
     lager:info("Test riak-admin status while down"),
-    {ok, {ExitCode, StatusOut}} = rt:admin(Node, ["status"], [return_exit_code]),
-    ?assertEqual(1, ExitCode),
-    ?assert(rt:str(StatusOut, "Node is not running!")),
+    {ok, StatusOut} = rt_cmd_line:admin(Node, ["status"]),
     ok.
 
 getpid_up_test(Node) ->
     lager:info("Test riak getpid on ~s", [Node]),
-    {ok, PidOut} = rt:riak(Node, ["getpid"]),
+    {ok, PidOut} = rt_cmd_line:riak(Node, ["getpid"]),
     ?assertNot(rt:str(PidOut, "")),
     ?assert(rt:str(PidOut, rpc:call(Node, os, getpid, []))),
     ok.
 
 getpid_down_test(Node) ->
     lager:info("Test riak getpid fails on ~s", [Node]),
-    {ok, PidOut} = rt:riak(Node, ["getpid"]),
+    {ok, PidOut} = rt_cmd_line:riak(Node, ["getpid"]),
     ?assert(rt:str(PidOut, "Node is not running!")),
     ok.

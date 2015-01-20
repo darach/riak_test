@@ -18,9 +18,10 @@
 %%
 %% -------------------------------------------------------------------
 -module(bucket_props_roundtrip).
--behaviour(riak_test).
--export([confirm/0]).
+-export([properties/0, confirm/2]).
+
 -include_lib("eunit/include/eunit.hrl").
+-include("rt.hrl").
 
 -define(BUCKET, <<"pbc_props_verify">>).
 -define(COMMIT_HOOK, {struct, [{<<"mod">>, <<"foo">>}, {<<"fun">>, <<"bar">>}]}).
@@ -52,9 +53,11 @@
          {young_vclock, 0, 20}
         ]).
 
-confirm() ->
-    [Node] = Nodes = rt:build_cluster(1),
-    ?assertEqual(ok, rt:wait_until_nodes_ready(Nodes)),
+properties() ->
+    rt_properties:new([{node_count, 1}]).
+
+confirm(Properties, _MD) ->
+    [Node] = rt_properties:get(nodes, Properties),
 
     [ check_prop_set_and_get(Node, Prop, FirstVal, SecondVal) ||
         {Prop, FirstVal, SecondVal} <- ?PROPS ],
@@ -63,8 +66,8 @@ confirm() ->
 
 check_prop_set_and_get(Node, Prop, One, Two) ->
     lager:info("-------- Testing roundtrip for property '~p' ---------", [Prop]),
-    HTTP = rt:httpc(Node),
-    PBC = rt:pbc(Node),
+    HTTP = rt_http:httpc(Node),
+    PBC = rt_pb:pbc(Node),
     lager:info("HTTP set = ~p", [One]),
     http_set_property(HTTP, Prop, One),
     lager:info("PBC get should == ~p", [One]),

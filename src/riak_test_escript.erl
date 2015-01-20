@@ -21,237 +21,342 @@
 %% @private
 -module(riak_test_escript).
 -include("rt.hrl").
+%% TODO: Temporary build workaround, remove!!
+-compile(export_all).
 -export([main/1]).
 -export([add_deps/1]).
 
-add_deps(Path) ->
-    {ok, Deps} = file:list_dir(Path),
-    [code:add_path(lists:append([Path, "/", Dep, "/ebin"])) || Dep <- Deps],
+-define(HEADER, [<<"Test">>, <<"Result">>, <<"Reason">>, <<"Test Duration">>]).
+
+main(Args) ->
+    {ParsedArgs, HarnessArgs, Tests, _} = prepare(Args),
+    Results = execute(Tests, ParsedArgs, HarnessArgs),
+    finalize(Results, ParsedArgs).
+
+prepare(Args) ->
+    {ParsedArgs, _, Tests, NonTests} = ParseResults = parse_args(Args),
+    io:format("Tests to run: ~p~n", [Tests]),
+    case NonTests of
+        [] ->
+            ok;
+        _ ->
+            io:format("These modules are not runnable tests: ~p~n",
+                      [[NTMod || {NTMod, _} <- NonTests]])
+    end,
+    ok = erlang_setup(ParsedArgs),
+    ok = test_setup(ParsedArgs),
+    ParseResults.
+
+execute(Tests, ParsedArgs, _HarnessArgs) ->
+    OutDir = proplists:get_value(outdir, ParsedArgs),
+    Report = report(ParsedArgs),
+    UpgradeList = upgrade_list(
+                    proplists:get_value(upgrade_path, ParsedArgs)),
+    Backend = proplists:get_value(backend, ParsedArgs, bitcask),
+
+    {ok, Executor} = riak_test_executor:start_link(Tests,
+                                                   Backend,
+                                                   OutDir,
+                                                   Report,
+                                                   UpgradeList,
+                                                   self()),
+    wait_for_results(Executor, [], length(Tests), 0).
+
+
+report_results(Results, Verbose) ->
+    %% TODO: Good place to also do giddyup reporting and provide a
+    %% place for extending to any other reporting sources that might
+    %% be useful.
+    print_summary(Results, undefined, Verbose),
     ok.
 
-cli_options() ->
+    %% TestResults = run_tests(Tests, Outdir, Report, HarnessArgs),
+    %% lists:filter(fun results_filter/1, TestResults).
+
+%% run_test(Test, Outdir, TestMetaData, Report, HarnessArgs, NumTests) ->
+%%     rt_cover:maybe_start(Test),
+%%     SingleTestResult = riak_test_runner:run(Test, Outdir, TestMetaData, HarnessArgs),
+
+    %% case NumTests of
+    %%     1 -> keep_them_up;
+    %%     _ -> rt_cluster:teardown()
+    %% end,
+
+%% TODO: Do this in the test runner
+%%     CoverDir = rt_config:get(cover_output, "coverage"),
+%% CoverFile = rt_cover:maybe_export_coverage(Test, CoverDir, erlang:phash2(TestMetaData)),
+%% publish_report(SingleTestResult, CoverFile, Report),
+
+%%     [{coverdata, CoverFile} | SingleTestResult].
+
+%% TODO: Use `TestCount' and `Completed' to display progress output
+wait_for_results(Executor, TestResults, TestCount, Completed) ->
+    receive
+        {Executor, {test_result, Result}} ->
+            wait_for_results(Executor, [Result | TestResults], TestCount, Completed+1);
+        {Executor, done} ->
+            rt_cover:stop(),
+            TestResults;
+        _ ->
+            wait_for_results(Executor, TestResults, TestCount, Completed)
+    end.
+
+finalize(TestResults, Args) ->
+    %% TODO: Fixup coverage reporting
+    %% [rt_cover:maybe_import_coverage(proplists:get_value(coverdata, R)) ||
+    %%     R <- TestResults],
+    %% CoverDir = rt_config:get(cover_output, "coverage"),
+    %% Coverage = rt_cover:maybe_write_coverage(all, CoverDir),
+
+    node_manager:stop(),
+    Verbose = proplists:is_defined(verbose, Args),
+    report_results(TestResults, Verbose),
+
+
+    %% Teardown = not proplists:get_value(keep, Args, false),
+    %% maybe_teardown(Teardown, TestResults, Coverage, Verbose),
+    ok.
+
 %% Option Name, Short Code, Long Code, Argument Spec, Help Message
+cli_options() ->
 [
  {help,               $h, "help",     undefined,  "Print this usage page"},
  {config,             $c, "conf",     string,     "specifies the project configuration"},
  {tests,              $t, "tests",    string,     "specifies which tests to run"},
  {suites,             $s, "suites",   string,     "which suites to run"},
+ {groups,             $g, "groups",   string,     "specifiy a list of test groups to run"},
  {dir,                $d, "dir",      string,     "run all tests in the specified directory"},
  {skip,               $x, "skip",     string,     "list of tests to skip in a directory"},
  {verbose,            $v, "verbose",  undefined,  "verbose output"},
  {outdir,             $o, "outdir",   string,     "output directory"},
  {backend,            $b, "backend",  atom,       "backend to test [memory | bitcask | eleveldb]"},
- {upgrade_version,    $u, "upgrade",  atom,       "which version to upgrade from [ previous | legacy ]"},
+ {upgrade_path,    $u, "upgrade-path",  atom,       "comma-separated list representing an upgrade path (e.g. 1.2.1,1.3.4,1.4.10,2.0.0)"},
  {keep,        undefined, "keep",     boolean,    "do not teardown cluster"},
  {report,             $r, "report",   string,     "you're reporting an official test run, provide platform info (e.g. ubuntu-1204-64)\nUse 'config' if you want to pull from ~/.riak_test.config"},
  {file,               $F, "file",     string,     "use the specified file instead of ~/.riak_test.config"}
 ].
 
 print_help() ->
-    getopt:usage(cli_options(),
-                 escript:script_name()),
+    getopt:usage(cli_options(), escript:script_name()),
     halt(0).
 
-run_help([]) -> true;
-run_help(ParsedArgs) ->
-    lists:member(help, ParsedArgs).
+add_deps(Path) ->
+    {ok, Deps} = file:list_dir(Path),
+    [code:add_path(lists:append([Path, "/", Dep, "/ebin"])) || Dep <- Deps],
+    ok.
 
-main(Args) ->
-    case filelib:is_dir("./ebin") of
-        true ->
-            code:add_patha("./ebin");
-        _ ->
-            meh
+test_setup(ParsedArgs) ->
+    %% File output
+    OutDir = proplists:get_value(outdir, ParsedArgs, "log"),
+    ensure_dir(OutDir),
+
+    lager_setup(OutDir),
+
+    %% Prepare the test harness
+    {NodeIds, NodeMap, VersionMap} = rt_harness:setup(),
+
+    %% Start the node manager
+    _ = node_manager:start_link(NodeIds, NodeMap, VersionMap),
+
+    %% Ensure existence of scratch_dir
+    case ensure_dir(rt_config:get(rt_scratch_dir) ++ "/test.file") of
+        ok ->
+            great;
+        {error, ErrorReason} ->
+            lager:error("Could not create scratch dir, ~p",
+                        [ErrorReason])
     end,
+    ok.
 
-    register(riak_test, self()),
-    {ParsedArgs, HarnessArgs} = case getopt:parse(cli_options(), Args) of
-        {ok, {P, H}} -> {P, H};
-        _ -> print_help()
-    end,
+-spec upgrade_list(undefined | string()) -> undefined | [string()].
+upgrade_list(undefined) ->
+    undefined;
+upgrade_list(Path) ->
+    string:tokens(Path, ",").
 
-    case run_help(ParsedArgs) of
-        true -> print_help();
-        _ -> ok
-    end,
+report(ParsedArgs) ->
+    case proplists:get_value(report, ParsedArgs, undefined) of
+        undefined ->
+            undefined;
+        "config" ->
+            rt_config:get(platform, undefined);
+        R ->
+            R
+    end.
 
-    %% ibrowse
-    application:load(ibrowse),
-    application:start(ibrowse),
-    %% Start Lager
-    application:load(lager),
+parse_args(Args) ->
+    help_or_parse_args(getopt:parse(cli_options(), Args)).
 
-    Config = proplists:get_value(config, ParsedArgs),
-    ConfigFile = proplists:get_value(file, ParsedArgs),
+help_or_parse_args({ok, {[], _}}) ->
+    print_help();
+help_or_parse_args({ok, {ParsedArgs, HarnessArgs}}) ->
+    help_or_parse_tests(ParsedArgs,
+                        HarnessArgs,
+                        lists:member(help, ParsedArgs));
+help_or_parse_args(_) ->
+    print_help().
 
+help_or_parse_tests(_, _, true) ->
+    print_help();
+help_or_parse_tests(ParsedArgs, HarnessArgs, false) ->
+    %% Have to load the `riak_test' config prior to assembling the
+    %% test metadata
+    load_initial_config(ParsedArgs),
+
+    TestData = compose_test_data(ParsedArgs),
+    {Tests, NonTests} = which_tests_to_run(report(ParsedArgs), TestData),
+    Offset = rt_config:get(offset, undefined),
+    Workers = rt_config:get(workers, undefined),
+    shuffle_tests(ParsedArgs, HarnessArgs, Tests, NonTests, Offset, Workers).
+
+load_initial_config(ParsedArgs) ->
     %% Loads application defaults
     application:load(riak_test),
 
     %% Loads from ~/.riak_test.config
-    rt_config:load(Config, ConfigFile),
+    rt_config:load(proplists:get_value(config, ParsedArgs),
+                   proplists:get_value(file, ParsedArgs)).
+
+shuffle_tests(_, _, [], _, _, _) ->
+    io:format("No tests are scheduled to run~n"),
+    halt(1);
+shuffle_tests(ParsedArgs, HarnessArgs, Tests, NonTests, undefined, _) ->
+    {ParsedArgs, HarnessArgs, Tests, NonTests};
+shuffle_tests(ParsedArgs, HarnessArgs, Tests, NonTests, _, undefined) ->
+    {ParsedArgs, HarnessArgs, Tests, NonTests};
+shuffle_tests(ParsedArgs, HarnessArgs, Tests, NonTests, Offset, Workers) ->
+    TestCount = length(Tests),
+    %% Avoid dividing by zero, computers hate that
+    Denominator = case Workers rem (TestCount+1) of
+                      0 -> 1;
+                      D -> D
+                  end,
+    ActualOffset = ((TestCount div Denominator) * Offset) rem (TestCount+1),
+    {TestA, TestB} = lists:split(ActualOffset, Tests),
+    lager:info("Offsetting ~b tests by ~b (~b workers, ~b offset)",
+               [TestCount, ActualOffset, Workers, Offset]),
+    {ParsedArgs, HarnessArgs, TestB ++ TestA, NonTests}.
+
+erlang_setup(_ParsedArgs) ->
+    register(riak_test, self()),
+    maybe_add_code_path("./ebin"),
+
+    %% ibrowse
+    load_and_start(ibrowse),
 
     %% Sets up extra paths earlier so that tests can be loadable
     %% without needing the -d flag.
     code:add_paths(rt_config:get(test_paths, [])),
 
-    %% Ensure existance of scratch_dir
-    case file:make_dir(rt_config:get(rt_scratch_dir)) of
-        ok -> great;
-        {error, eexist} -> great;
-        {ErrorType, ErrorReason} -> lager:error("Could not create scratch dir, {~p, ~p}", [ErrorType, ErrorReason])
-    end,
-
-    %% Fileoutput
-    Outdir = proplists:get_value(outdir, ParsedArgs),
-    ConsoleLagerLevel = case Outdir of
-        undefined -> rt_config:get(lager_level, info);
-        _ ->
-            filelib:ensure_dir(Outdir),
-            notice
-    end,
-
-    application:set_env(lager, handlers, [{lager_console_backend, ConsoleLagerLevel},
-                                          {lager_file_backend, [{file, "log/test.log"},
-                                                                {level, ConsoleLagerLevel}]}]),
-    lager:start(),
-
-    %% Report
-    Report = case proplists:get_value(report, ParsedArgs, undefined) of
-        undefined -> undefined;
-        "config" -> rt_config:get(platform, undefined);
-        R -> R
-    end,
-
-    Verbose = proplists:is_defined(verbose, ParsedArgs),
-
-    Suites = proplists:get_all_values(suites, ParsedArgs),
-    case Suites of
-        [] -> ok;
-        _ -> io:format("Suites are not currently supported.")
-    end,
-
-    CommandLineTests = parse_command_line_tests(ParsedArgs),
-    Tests0 = which_tests_to_run(Report, CommandLineTests),
-
-    case Tests0 of
-        [] ->
-            lager:warning("No tests are scheduled to run"),
-            init:stop(1);
-        _ -> keep_on_keepin_on
-    end,
-
-    Tests = case {rt_config:get(offset, undefined), rt_config:get(workers, undefined)} of
-                {undefined, undefined} ->
-                    Tests0;
-                {undefined, _} ->
-                    Tests0;
-                {_, undefined} ->
-                    Tests0;
-                {Offset, Workers} ->
-                    TestCount = length(Tests0),
-                    %% Avoid dividing by zero, computers hate that
-                    Denominator = case Workers rem (TestCount+1) of
-                                      0 -> 1;
-                                      D -> D
-                                  end,
-                    ActualOffset = ((TestCount div Denominator) * Offset) rem (TestCount+1),
-                    {TestA, TestB} = lists:split(ActualOffset, Tests0),
-                    lager:info("Offsetting ~b tests by ~b (~b workers, ~b"
-                               " offset)", [TestCount, ActualOffset, Workers,
-                                            Offset]),
-                    TestB ++ TestA
-            end,
-
-    io:format("Tests to run: ~p~n", [Tests]),
     %% Two hard-coded deps...
     add_deps(rt:get_deps()),
     add_deps("deps"),
 
     [add_deps(Dep) || Dep <- rt_config:get(rt_deps, [])],
-    ENode = rt_config:get(rt_nodename, 'riak_test@127.0.0.1'),
-    Cookie = rt_config:get(rt_cookie, riak),
-    CoverDir = rt_config:get(cover_output, "coverage"),
     [] = os:cmd("epmd -daemon"),
-    net_kernel:start([ENode]),
-    erlang:set_cookie(node(), Cookie),
-
-    TestResults = lists:filter(fun results_filter/1, [ run_test(Test, Outdir, TestMetaData, Report, HarnessArgs, length(Tests)) || {Test, TestMetaData} <- Tests]),
-    [rt_cover:maybe_import_coverage(proplists:get_value(coverdata, R)) || R <- TestResults],
-    Coverage = rt_cover:maybe_write_coverage(all, CoverDir),
-
-    Teardown = not proplists:get_value(keep, ParsedArgs, false),
-    maybe_teardown(Teardown, TestResults, Coverage, Verbose),
+    net_kernel:start([rt_config:get(rt_nodename, 'riak_test@127.0.0.1')]),
+    erlang:set_cookie(node(), rt_config:get(rt_cookie, riak)),
     ok.
 
-maybe_teardown(false, TestResults, Coverage, Verbose) ->
-    print_summary(TestResults, Coverage, Verbose),
-    lager:info("Keeping cluster running as requested");
-maybe_teardown(true, TestResults, Coverage, Verbose) ->
-    case {length(TestResults), proplists:get_value(status, hd(TestResults))} of
-        {1, fail} ->
-            print_summary(TestResults, Coverage, Verbose),
-            so_kill_riak_maybe();
-        _ ->
-            lager:info("Multiple tests run or no failure"),
-            rt:teardown(),
-            print_summary(TestResults, Coverage, Verbose)
-    end,
-    ok.
+maybe_add_code_path(Path) ->
+    maybe_add_code_path(Path, filelib:is_dir(Path)).
 
-parse_command_line_tests(ParsedArgs) ->
-    Backends = case proplists:get_all_values(backend, ParsedArgs) of
-        [] -> [undefined];
-        Other -> Other
-    end,
-    Upgrades = case proplists:get_all_values(upgrade_version, ParsedArgs) of
-                   [] -> [undefined];
-                   UpgradeList -> UpgradeList
-               end,
+maybe_add_code_path(Path, true) ->
+    code:add_patha(Path);
+maybe_add_code_path(_, false) ->
+    meh.
+
+load_and_start(Application) ->
+    application:load(Application),
+    application:start(Application).
+
+ensure_dir(undefined) ->
+    ok;
+ensure_dir(Dir) ->
+    filelib:ensure_dir(Dir).
+
+lager_setup(OutputDir) ->
+    set_lager_env(OutputDir,
+                  rt_config:get(lager_console_level, notice),
+                  rt_config:get(lager_file_level, info)),
+    lager:start().
+
+set_lager_env(OutputDir, ConsoleLevel, FileLevel) ->
+    application:load(lager),
+    HandlerConfig = [{lager_console_backend, ConsoleLevel},
+                     {lager_file_backend, [{file, filename:join(OutputDir, "test.log")},
+                                           {level, FileLevel}]}],
+    application:set_env(lager, handlers, HandlerConfig).
+
+%% maybe_teardown(false, TestResults, Coverage, Verbose) ->
+%%     print_summary(TestResults, Coverage, Verbose),
+%%     lager:info("Keeping cluster running as requested");
+%% maybe_teardown(true, TestResults, Coverage, Verbose) ->
+%%     case {length(TestResults), proplists:get_value(status, hd(TestResults))} of
+%%         {1, fail} ->
+%%             print_summary(TestResults, Coverage, Verbose),
+%%             so_kill_riak_maybe();
+%%         _ ->
+%%             lager:info("Multiple tests run or no failure"),
+%%             rt_cluster:teardown(),
+%%             print_summary(TestResults, Coverage, Verbose)
+%%     end,
+%%     ok.
+
+-spec comma_tokenizer(string(), [string()]) -> [string()].
+comma_tokenizer(S, Acc) ->
+    string:tokens(S, ", ") ++ Acc.
+
+compose_test_data(ParsedArgs) ->
+    RawTestList = proplists:get_all_values(tests, ParsedArgs),
+    RawGroupList = proplists:get_all_values(groups, ParsedArgs),
+    TestList = lists:foldl(fun comma_tokenizer/2, [], RawTestList),
+    GroupList = lists:foldl(fun comma_tokenizer/2, [], RawGroupList),
+
     %% Parse Command Line Tests
     {CodePaths, SpecificTests} =
         lists:foldl(fun extract_test_names/2,
                     {[], []},
-                    proplists:get_all_values(tests, ParsedArgs)),
+                    TestList),
+
     [code:add_patha(CodePath) || CodePath <- CodePaths,
                                  CodePath /= "."],
-    Dirs = proplists:get_all_values(dir, ParsedArgs),
+
+    Dirs = get_test_dirs(ParsedArgs, default_test_dir(GroupList)),
     SkipTests = string:tokens(proplists:get_value(skip, ParsedArgs, []), [$,]),
-    DirTests = lists:append([load_tests_in_dir(Dir, SkipTests) || Dir <- Dirs]),
-    lists:foldl(fun(Test, Tests) ->
-            [{
-              list_to_atom(Test),
-              [
-                  {id, -1},
-                  {platform, <<"local">>},
-                  {version, rt:get_version()},
-                  {project, list_to_binary(rt_config:get(rt_project, "undefined"))}
-              ] ++
-              [ {backend, Backend} || Backend =/= undefined ] ++
-              [ {upgrade_version, Upgrade} || Upgrade =/= undefined ]}
-             || Backend <- Backends,
-                Upgrade <- Upgrades ] ++ Tests
-        end, [], lists:usort(DirTests ++ SpecificTests)).
+    DirTests = lists:append([load_tests_in_dir(Dir, GroupList, SkipTests) || Dir <- Dirs]),
+    lists:usort(DirTests ++ SpecificTests).
+
+-spec default_test_dir([string()]) -> [string()].
+%% @doc If any groups have been specified then we want to check in the
+%% local test directory by default; otherwise, the default behavior is
+%% that no directory is used to pull tests from.
+default_test_dir([]) ->
+    [];
+default_test_dir(_) ->
+    ["./ebin"].
+
+-spec get_test_dirs(term(), [string()]) -> [string()].
+get_test_dirs(ParsedArgs, DefaultDirs) ->
+    case proplists:get_all_values(dir, ParsedArgs) of
+        [] ->
+            DefaultDirs;
+        Dirs ->
+            Dirs
+    end.
 
 extract_test_names(Test, {CodePaths, TestNames}) ->
     {[filename:dirname(Test) | CodePaths],
-     [filename:rootname(filename:basename(Test)) | TestNames]}.
+     [list_to_atom(filename:rootname(filename:basename(Test))) | TestNames]}.
 
 which_tests_to_run(undefined, CommandLineTests) ->
-    {Tests, NonTests} =
-        lists:partition(fun is_runnable_test/1, CommandLineTests),
-    lager:info("These modules are not runnable tests: ~p",
-               [[NTMod || {NTMod, _} <- NonTests]]),
-    Tests;
-which_tests_to_run(Platform, []) -> giddyup:get_suite(Platform);
+    lists:partition(fun is_runnable_test/1, CommandLineTests);
+which_tests_to_run(Platform, []) ->
+    giddyup:get_suite(Platform);
 which_tests_to_run(Platform, CommandLineTests) ->
     Suite = filter_zip_suite(Platform, CommandLineTests),
-    {Tests, NonTests} =
-        lists:partition(fun is_runnable_test/1,
-                        lists:foldr(fun filter_merge_tests/2, [], Suite)),
-
-    lager:info("These modules are not runnable tests: ~p",
-               [[NTMod || {NTMod, _} <- NonTests]]),
-    Tests.
+    lists:partition(fun is_runnable_test/1,
+                    lists:foldr(fun filter_merge_tests/2, [], Suite)).
 
 filter_zip_suite(Platform, CommandLineTests) ->
     [ {SModule, SMeta, CMeta} || {SModule, SMeta} <- giddyup:get_suite(Platform),
@@ -281,39 +386,72 @@ filter_merge_meta(SMeta, CMeta, [Field|Rest]) ->
     end.
 
 %% Check for api compatibility
-is_runnable_test({TestModule, _}) ->
-    {Mod, Fun} = riak_test_runner:function_name(TestModule),
+is_runnable_test(TestModule) ->
+    {Mod, Fun} = riak_test_runner:function_name(confirm, TestModule),
     code:ensure_loaded(Mod),
-    erlang:function_exported(Mod, Fun, 0).
+    erlang:function_exported(Mod, Fun, 0) orelse
+        erlang:function_exported(Mod, Fun, 1).
 
-run_test(Test, Outdir, TestMetaData, Report, HarnessArgs, NumTests) ->
-    rt_cover:maybe_start(Test),
-    SingleTestResult = riak_test_runner:confirm(Test, Outdir, TestMetaData,
-                                                HarnessArgs),
-    CoverDir = rt_config:get(cover_output, "coverage"),
-    case NumTests of
-        1 -> keep_them_up;
-        _ -> rt:teardown()
-    end,
-    CoverageFile = rt_cover:maybe_export_coverage(Test, CoverDir, erlang:phash2(TestMetaData)),
-    case Report of
-        undefined -> ok;
-        _ ->
-            {value, {log, L}, TestResult} = lists:keytake(log, 1, SingleTestResult),
-            case giddyup:post_result(TestResult) of
-                error -> woops;
-                {ok, Base} ->
-                    %% Now push up the artifacts, starting with the test log
-                    giddyup:post_artifact(Base, {"riak_test.log", L}),
-                    [ giddyup:post_artifact(Base, File) || File <- rt:get_node_logs() ],
-                    [giddyup:post_artifact(Base, {filename:basename(CoverageFile) ++ ".gz",
-                                                  zlib:gzip(element(2,file:read_file(CoverageFile)))}) || CoverageFile /= cover_disabled ],
-                    ResultPlusGiddyUp = TestResult ++ [{giddyup_url, list_to_binary(Base)}],
-                    [ rt:post_result(ResultPlusGiddyUp, WebHook) || WebHook <- get_webhooks() ]
-            end
-    end,
-    rt_cover:stop(),
-    [{coverdata, CoverageFile} | SingleTestResult].
+get_group_tests(Tests, Groups) ->
+    lists:filter(fun(Test) ->
+                         Mod = list_to_atom(Test),
+                         Attrs = Mod:module_info(attributes),
+                         match_group_attributes(Attrs, Groups)
+                 end, Tests).
+
+match_group_attributes(Attributes, Groups) ->
+    case proplists:get_value(test_type, Attributes) of
+        undefined ->
+            false;
+        TestTypes ->
+            lists:member(true,
+                         [ TestType == list_to_atom(Group)
+                           || Group <- Groups, TestType <- TestTypes ])
+    end.
+
+%% run_tests(Tests, Outdir, Report, HarnessArgs) ->
+    %% Need properties for tests prior to getting here Need server to
+    %% manage the aquisition of nodes and to handle comparison of test
+    %% `node_count' property with resources available. Also handle
+    %% notification of test completion. Hmm, maybe test execution
+    %% should be handled by a `gen_fsm' at this point to distinguish
+    %% the case when there are tests left to be tried with available
+    %% resources versus all have been tried or resources are
+    %% exhausted.
+
+%% [run_test(Test,
+%%                             Outdir,
+%%                             TestMetaData,
+%%                             Report,
+%%                             HarnessArgs,
+%%                             TestCount) ||
+%%                       {Test, TestMetaData} <- Tests],
+
+publish_report(_SingleTestResult, _CoverFile, undefined) ->
+    ok;
+publish_report(SingleTestResult, CoverFile, _Report) ->
+    {value, {log, Log}, TestResult} = lists:keytake(log, 1, SingleTestResult),
+    publish_artifacts(TestResult,
+                      Log,
+                      CoverFile,
+                      giddyup:post_result(TestResult)).
+
+publish_artifacts(_TestResult, _Log, _CoverFile, error) ->
+    whoomp; %% there it is
+publish_artifacts(TestResult, Log, CoverFile, {ok, Base}) ->
+            %% Now push up the artifacts, starting with the test log
+            giddyup:post_artifact(Base, {"riak_test.log", Log}),
+            [giddyup:post_artifact(Base, File) || File <- rt:get_node_logs()],
+            post_cover_artifact(Base, CoverFile),
+            ResultPlusGiddyUp = TestResult ++ [{giddyup_url, list_to_binary(Base)}],
+            [rt:post_result(ResultPlusGiddyUp, WebHook) || WebHook <- get_webhooks()].
+
+post_cover_artifact(_Base, cover_disabled) ->
+    ok;
+post_cover_artifact(Base, CoverFile) ->
+    CoverArchiveName = filename:basename(CoverFile) ++ ".gz",
+    CoverArchive = zlib:gzip(element(2, file:read_file(CoverFile))),
+    giddyup:post_artifact(Base, {CoverArchiveName, CoverArchive}).
 
 get_webhooks() ->
     Hooks = lists:foldl(fun(E, Acc) -> [parse_webhook(E) | Acc] end,
@@ -333,44 +471,80 @@ parse_webhook(Props) ->
             undefined
     end.
 
-print_summary(TestResults, CoverResult, Verbose) ->
-    io:format("~nTest Results:~n"),
+test_summary_fun({Test, pass, _}, {{Pass, _Fail, _Skipped}, Width}) ->
+    TestNameLength = length(atom_to_list(Test)),
+    UpdWidth =
+        case TestNameLength > Width of
+            true ->
+                TestNameLength;
+            false ->
+                Width
+        end,
+    {{Pass+1, _Fail, _Skipped}, UpdWidth};
+test_summary_fun({Test, {fail, _}, _}, {{_Pass, Fail, _Skipped}, Width}) ->
+    TestNameLength = length(atom_to_list(Test)),
+    UpdWidth =
+        case TestNameLength > Width of
+            true ->
+                TestNameLength;
+            false ->
+                Width
+        end,
+    {{_Pass, Fail+1, _Skipped}, UpdWidth};
+test_summary_fun({Test, {skipped, _}, _}, {{_Pass, _Fail, Skipped}, Width}) ->
+    TestNameLength = length(atom_to_list(Test)),
+    UpdWidth =
+        case TestNameLength > Width of
+            true ->
+                TestNameLength;
+            false ->
+                Width
+        end,
+    {{_Pass, _Fail, Skipped+1}, UpdWidth}.
 
-    Results = [
-                [ atom_to_list(proplists:get_value(test, SingleTestResult)) ++ "-" ++
-                      backend_list(proplists:get_value(backend, SingleTestResult)),
-                  proplists:get_value(status, SingleTestResult),
-                  proplists:get_value(reason, SingleTestResult)]
-                || SingleTestResult <- TestResults],
-    Width = test_name_width(Results),
+format_test_row({Test, Result, Duration}, _Width) ->
+    TestString = atom_to_list(Test),
+    case Result of
+        {Status, Reason} ->
+            [TestString, Status, Reason, Duration];
+        pass ->
+            [TestString, "pass", "N/A", Duration]
+    end.
 
-    Print = fun(Test, Status, Reason) ->
-        case {Status, Verbose} of
-            {fail, true} -> io:format("~s: ~s ~p~n", [string:left(Test, Width), Status, Reason]);
-            _ -> io:format("~s: ~s~n", [string:left(Test, Width), Status])
-        end
+print_summary(TestResults, _CoverResult, Verbose) ->
+    io:format("~nTest Results:~n~n"),
+
+    {StatusCounts, Width} = lists:foldl(fun test_summary_fun/2, {{0,0,0}, 0}, TestResults),
+
+    case Verbose of
+        true ->
+            Rows =
+                [format_test_row(Result, Width) || Result <- TestResults],
+            Table = clique_table:autosize_create_table(?HEADER, Rows),
+            io:format("~ts~n", [Table]);
+        false ->
+            ok
     end,
-    [ Print(Test, Status, Reason) || [Test, Status, Reason] <- Results],
 
-    PassCount = length(lists:filter(fun(X) -> proplists:get_value(status, X) =:= pass end, TestResults)),
-    FailCount = length(lists:filter(fun(X) -> proplists:get_value(status, X) =:= fail end, TestResults)),
+    {PassCount, FailCount, SkippedCount} = StatusCounts,
     io:format("---------------------------------------------~n"),
     io:format("~w Tests Failed~n", [FailCount]),
+    io:format("~w Tests Skipped~n", [SkippedCount]),
     io:format("~w Tests Passed~n", [PassCount]),
     Percentage = case PassCount == 0 andalso FailCount == 0 of
         true -> 0;
-        false -> (PassCount / (PassCount + FailCount)) * 100
+        false -> (PassCount / (PassCount + FailCount + SkippedCount)) * 100
     end,
     io:format("That's ~w% for those keeping score~n", [Percentage]),
 
-    case CoverResult of
-        cover_disabled ->
-            ok;
-        {Coverage, AppCov} ->
-            io:format("Coverage : ~.1f%~n", [Coverage]),
-            [io:format("    ~s : ~.1f%~n", [App, Cov])
-             || {App, Cov, _} <- AppCov]
-    end,
+    %% case CoverResult of
+    %%     cover_disabled ->
+    %%         ok;
+    %%     {Coverage, AppCov} ->
+    %%         io:format("Coverage : ~.1f%~n", [Coverage]),
+    %%         [io:format("    ~s : ~.1f%~n", [App, Cov])
+    %%          || {App, Cov, _} <- AppCov]
+    %% end,
     ok.
 
 test_name_width(Results) ->
@@ -386,35 +560,47 @@ backend_list(Backends) when is_list(Backends) ->
               end,
     lists:foldl(FoldFun, [], Backends).
 
-results_filter(Result) ->
-    case proplists:get_value(status, Result) of
-        not_a_runnable_test ->
-            false;
-        _ ->
-            true
-    end.
-
-load_tests_in_dir(Dir, SkipTests) ->
+load_tests_in_dir(Dir, Groups, SkipTests) ->
     case filelib:is_dir(Dir) of
         true ->
             code:add_path(Dir),
             lists:sort(
-              lists:foldl(load_tests_folder(SkipTests),
+              lists:foldl(load_tests_folder(Groups, SkipTests),
                           [],
                           filelib:wildcard("*.beam", Dir)));
-        _ -> io:format("~s is not a dir!~n", [Dir])
+        _ ->
+            io:format("~s is not a dir!~n", [Dir])
     end.
 
-load_tests_folder(SkipTests) ->
+load_tests_folder([], SkipTests) ->
     fun(X, Acc) ->
+            %% Drop the .beam suffix
             Test = string:substr(X, 1, length(X) - 5),
             case lists:member(Test, SkipTests) of
                 true ->
                     Acc;
                 false ->
-                    [Test | Acc]
+                    [list_to_atom(Test) | Acc]
+            end
+    end;
+load_tests_folder(Groups, SkipTests) ->
+    fun(X, Acc) ->
+            %% Drop the .beam suffix
+            Test = string:substr(X, 1, length(X) - 5),
+            case group_match(Test, Groups)
+                andalso not lists:member(Test, SkipTests) of
+                true ->
+                    [list_to_atom(Test) | Acc];
+                false ->
+                    Acc
             end
     end.
+
+-spec group_match(string(), [string()]) -> boolean().
+group_match(Test, Groups) ->
+    Mod = list_to_atom(Test),
+    Attrs = Mod:module_info(attributes),
+    match_group_attributes(Attrs, Groups).
 
 so_kill_riak_maybe() ->
     io:format("~n~nSo, we find ourselves in a tricky situation here. ~n"),
@@ -422,8 +608,10 @@ so_kill_riak_maybe() ->
     io:format("Would you like to leave Riak running in order to debug?~n"),
     Input = io:get_chars("[Y/n] ", 1),
     case Input of
-        "n" -> rt:teardown();
-        "N" -> rt:teardown();
+        "n" ->
+            rt_cluster:teardown();
+        "N" ->
+            rt_cluster:teardown();
         _ ->
             io:format("Leaving Riak Up... "),
             rt:whats_up()
