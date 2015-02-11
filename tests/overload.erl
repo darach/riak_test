@@ -65,34 +65,23 @@ setup() ->
                            {vnode_overload_threshold, undefined}]},
               {riak_kv, [{fsm_limit, undefined},
                          {storage_backend, riak_kv_memory_backend},
-                         {anti_entropy, {off, []}}]}],
-    Nodes = rt_cluster:build_cluster(2, Config),
-    [_Node1, Node2] = Nodes,
+                         {anti_entropy_build_limit, {100, 1000}},
+                         {anti_entropy_concurrency, 100},
+                         {anti_entropy_tick, 100},
+                         {anti_entropy, {on, []}},
+                         {anti_entropy_timeout, 5000}]},
+              {riak_api, [{pb_backlog, 1024}]}],
+    ensemble_util:build_cluster(5, Config, 5).
 
-    Ring = rt_ring:get_ring(Node2),
-    Hash = riak_core_util:chash_std_keyfun({?BUCKET, ?KEY}),
-    PL = lists:sublist(riak_core_ring:preflist(Hash, Ring), 3),
-    Victim = hd([Idx || {Idx, Node} <- PL,
-                        Node =:= Node2]),
-    RO = riak_object:new(?BUCKET, ?KEY, <<"test">>),
-
-    %% TODO commented out to get merge completed .. must be reconciled -- jsb
-    %% ok = test_no_overload_protection(Nodes, BKV),
-    ok = test_vnode_protection(Nodes, Victim, RO),
-    ok = test_fsm_protection(Nodes, Victim, RO),
-    pass.
-
-%% test_no_overload_protection(Nodes, BKV) ->
-%%     lager:info("Testing with no overload protection"),
-%%     ProcFun = fun(X) ->
-%%                       lager:info("in test_no_overload_protection ProcFun, Procs:~p, Metric:~p", [X, ?NUM_REQUESTS]),
-%%                       X >= ?NUM_REQUESTS
-%%               end,
-%%     QueueFun = fun(X) ->
-%%                       lager:info("in test_no_overload QueueFun, queue size:~p, Metric:~p", [X, ?NUM_REQUESTS]),
-%%                       X >= ?NUM_REQUESTS
-%%               end,
-%%     verify_test_results(run_test(Nodes, BKV), ConsistentType, ProcFun, QueueFun).
+test_no_overload_protection(_Nodes, _BKV, true) ->
+    ok;
+test_no_overload_protection(Nodes, BKV, ConsistentType) ->
+    lager:info("Testing with no overload protection"),
+    ProcFun = build_predicate_gte(test_no_overload_protection, ?NUM_REQUESTS,
+                                  "ProcFun", "Procs"),
+    QueueFun = build_predicate_gte(test_no_overload_protection, ?NUM_REQUESTS,
+                                  "QueueFun", "Queue Size"),
+    verify_test_results(run_test(Nodes, BKV), ConsistentType, ProcFun, QueueFun).
 
 verify_test_results({_NumProcs, QueueLen}, true, _, QueueFun) ->
     ?assert(QueueFun(QueueLen));
@@ -114,14 +103,8 @@ test_vnode_protection(Nodes, BKV, ConsistentType) ->
     rt:pmap(fun(Node) ->
                     rt_config:update_app_config(Node, Config)
             end, Nodes),
-    ProcFun = fun(X) ->
-                      lager:info("in test_vnode_protection ProcFun, Procs:~p, Metric:~p", [X, (2*?NUM_REQUESTS * 1.5)]),
-                      X =< (2*?THRESHOLD * 1.5)
-              end,
-    QueueFun = fun(X) ->
-                      lager:info("in test_vnode_protection QueueFun, QueueSize:~p, Metric:~p", [X, (?NUM_REQUESTS * 1.1)]),
-                      X =< (?THRESHOLD * 1.1)
-              end,
+    ProcFun = build_predicate_lt(test_vnode_protection, (2*?THRESHOLD * 1.5), "ProcFun", "Procs"),
+    QueueFun = build_predicate_lt(test_vnode_protection, (?THRESHOLD * 1.1), "QueueFun", "QueueSize"),
     verify_test_results(run_test(Nodes, BKV), ConsistentType, ProcFun, QueueFun),
 
     [Node1 | _] = Nodes,
@@ -134,15 +117,10 @@ test_vnode_protection(Nodes, BKV, ConsistentType) ->
 
     lager:info("Suspending vnode proxy for ~p", [Victim]),
     Pid = suspend_vnode_proxy(Victim),
-    ProcFun2 = fun(X) ->
-                      lager:info("in test_vnode_protection after suspend ProcFun, Procs:~p, Metric:~p", [X, ?NUM_REQUESTS]),
-                      X >= ?NUM_REQUESTS
-
-              end,
-    QueueFun2 = fun(X) ->
-                      lager:info("in test_vnode_protection after suspend QueueFun, QueueSize:~p, Metric:~p", [X, (?THRESHOLD * 1.1)]),
-                      X =< (?THRESHOLD * 1.1)
-              end,
+    ProcFun2 = build_predicate_gte("test_vnode_protection after suspend",
+                                   (?NUM_REQUESTS), "ProcFun", "Procs"),
+    QueueFun2 = build_predicate_lt("test_vnode_protection after suspend",
+                                   (?THRESHOLD) * 1.1, "QueueFun", "QueueSize"),
     verify_test_results(run_test(Nodes, BKV), ConsistentType, ProcFun2, QueueFun2),
     Pid ! resume,
     ok.
@@ -154,14 +132,10 @@ test_fsm_protection(Nodes, BKV, ConsistentType) ->
     rt:pmap(fun(Node) ->
                     rt_config:update_app_config(Node, Config)
             end, Nodes),
-    ProcFun = fun(X) ->
-                      lager:info("in test_fsm_protection ProcFun, Procs:~p, Metric:~p", [X, (?THRESHOLD * 1.1)]),
-                      X =< (?THRESHOLD * 1.2)
-              end,
-    QueueFun = fun(X) ->
-                      lager:info("in test_fsm_protection QueueFun, QueueSize:~p, Metric:~p", [X, (?THRESHOLD * 1.1)]),
-                      X =< (?THRESHOLD * 1.2)
-              end,
+    ProcFun = build_predicate_lt(test_fsm_protection, (?THRESHOLD * 1.2),
+                                 "ProcFun", "Procs"),
+    QueueFun = build_predicate_lt(test_fsm_protection, (?THRESHOLD * 1.2),
+                                  "QueueFun", "QueueSize"),
     verify_test_results(run_test(Nodes, BKV), ConsistentType, ProcFun, QueueFun),
     ok.
 
@@ -495,3 +469,21 @@ remote_vnode_queue(Idx) ->
     {ok, Pid} = riak_core_vnode_manager:get_vnode_pid(Idx, riak_kv_vnode),
     {message_queue_len, Len} = process_info(Pid, message_queue_len),
     Len.
+
+%% In tests that do not expect work to be shed, we want to confirm that
+%% at least ?NUM_REQUESTS (processes|queue entries) are handled.
+build_predicate_gte(Test, Metric, Label, ValueLabel) ->
+    fun (X) ->
+        lager:info("in test ~w ~w, ~w:~w, expected no overload, Metric:>=~w",
+                   [Test, Label, ValueLabel, X, Metric]),
+        X >= Metric
+    end.
+%% In tests that expect work to be shed due to overload, the success
+%% condition is simply that the number of (fsms|queue entries) is
+%% less than ?NUM_REQUESTS.
+build_predicate_lt(Test, Metric, Label, ValueLabel) ->
+    fun (X) ->
+        lager:info("in test ~w ~w, ~w:~w, expected overload, Metric:<~w",
+                   [Test, Label, ValueLabel, X, Metric]),
+        X < Metric
+    end.
