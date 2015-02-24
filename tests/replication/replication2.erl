@@ -129,7 +129,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
             %% check that the keys we wrote initially aren't replicated yet, because
             %% we've disabled fullsync_on_connect
             lager:info("Check keys written before repl was connected are not present"),
-            Res2 = rt_systest:read(BFirst, 1, 100, TestBucket, 2),
+            Res2 = rt:systest_read(BFirst, 1, 100, TestBucket, 2),
             ?assertEqual(100, length(Res2)),
 
             log_to_nodes(AllNodes, "Test fullsync with leader ~p", [LeaderA]),
@@ -189,7 +189,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
     log_to_nodes(AllNodes, "Testing master failover: stopping ~p", [LeaderA]),
 
     lager:info("Testing master failover: stopping ~p", [LeaderA]),
-    rt_node:stop(LeaderA),
+    rt:stop(LeaderA),
     rt:wait_until_unpingable(LeaderA),
     ASecond = hd(ANodes -- [LeaderA]),
     repl_util:wait_until_leader(ASecond),
@@ -215,7 +215,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
     log_to_nodes(AllNodes, "Testing client failover: stopping ~p", [LeaderB]),
 
     lager:info("Testing client failover: stopping ~p", [LeaderB]),
-    rt_node:stop(LeaderB),
+    rt:stop(LeaderB),
     rt:wait_until_unpingable(LeaderB),
     BSecond = hd(BNodes -- [LeaderB]),
     repl_util:wait_until_leader(BSecond),
@@ -248,7 +248,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
     log_to_nodes(AllNodes, "Test fullsync after restarting ~p", [LeaderA]),
 
     lager:info("Restarting down node ~p", [LeaderA]),
-    rt_node:start(LeaderA),
+    rt:start(LeaderA),
     rt:wait_until_pingable(LeaderA),
     rt:wait_for_service(LeaderA, [riak_kv, riak_repl]),
     repl_util:start_and_wait_until_fullsync_complete(LeaderA2),
@@ -304,7 +304,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
     lager:info("Finished Joe's Section"),
 
     lager:info("Restarting down node ~p", [LeaderB]),
-    rt_node:start(LeaderB),
+    rt:start(LeaderB),
     rt:wait_until_pingable(LeaderB),
 
     lager:info("Nodes restarted"),
@@ -350,16 +350,16 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
             FullsyncOnly, 2)),
 
     lager:info("Check the fullsync only bucket didn't replicate the writes"),
-    Res6 = rt_systest:read(BSecond, 1, 100, FullsyncOnly, 2),
+    Res6 = rt:systest_read(BSecond, 1, 100, FullsyncOnly, 2),
     ?assertEqual(100, length(Res6)),
 
     lager:info("Check the realtime only bucket that was written to offline "
         "isn't replicated"),
-    Res7 = rt_systest:read(BSecond, 1, 100, RealtimeOnly, 2),
+    Res7 = rt:systest_read(BSecond, 1, 100, RealtimeOnly, 2),
     ?assertEqual(100, length(Res7)),
 
     lager:info("Check the {repl, false} bucket didn't replicate"),
-    Res8 = rt_systest:read(BSecond, 1, 100, NoRepl, 2),
+    Res8 = rt:systest_read(BSecond, 1, 100, NoRepl, 2),
     ?assertEqual(100, length(Res8)),
 
     %% do a fullsync, make sure that fullsync_only is replicated, but
@@ -371,7 +371,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
             FullsyncOnly, 2)),
 
     lager:info("Check realtime only bucket didn't replicate"),
-    Res10 = rt_systest:read(BSecond, 1, 100, RealtimeOnly, 2),
+    Res10 = rt:systest_read(BSecond, 1, 100, RealtimeOnly, 2),
     ?assertEqual(100, length(Res10)),
 
     lager:info("Write 100 more keys into realtime only bucket on ~p",
@@ -386,11 +386,11 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
             RealtimeOnly, 2)),
 
     lager:info("Check the older keys in the realtime bucket did not replicate"),
-    Res12 = rt_systest:read(BSecond, 1, 100, RealtimeOnly, 2),
+    Res12 = rt:systest_read(BSecond, 1, 100, RealtimeOnly, 2),
     ?assertEqual(100, length(Res12)),
 
     lager:info("Check {repl, false} bucket didn't replicate"),
-    Res13 = rt_systest:read(BSecond, 1, 100, NoRepl, 2),
+    Res13 = rt:systest_read(BSecond, 1, 100, NoRepl, 2),
     ?assertEqual(100, length(Res13)),
 
     log_to_nodes(AllNodes, "Testing offline realtime queueing"),
@@ -440,7 +440,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
 
     lager:info("Stopping node ~p", [Target]),
 
-    rt_node:stop(Target),
+    rt:stop(Target),
     rt:wait_until_unpingable(Target),
 
     lager:info("Starting realtime"),
@@ -452,7 +452,7 @@ replication([AFirst|_] = ANodes, [BFirst|_] = BNodes, Connected) ->
 
     lager:info("Restarting node ~p", [Target]),
 
-    rt_node:start(Target),
+    rt:start(Target),
     rt:wait_until_pingable(Target),
     rt:wait_for_service(Target, riak_repl),
     timer:sleep(5000),
@@ -468,13 +468,13 @@ pb_write_during_shutdown(Target, BSecond, TestBucket) ->
     ConnInfo = proplists:get_value(Target, rt:connection_info([Target])),
     {IP, Port} = proplists:get_value(pb, ConnInfo),
     lager:info("Connecting to pb socket ~p:~p on ~p", [IP, Port, Target]),
-    PBSock = rt_pb:pbc(Target),
+    PBSock = rt:pbc(Target),
 
     %% do the stop in the background while we're writing keys
     spawn(fun() ->
                 timer:sleep(500),
                 lager:info("Stopping node ~p again", [Target]),
-                rt_node:stop(Target),
+                rt:stop(Target),
                 lager:info("Node stopped")
            end),
 
@@ -490,17 +490,17 @@ pb_write_during_shutdown(Target, BSecond, TestBucket) ->
     lager:info("got ~p write failures", [length(WriteErrors)]),
     timer:sleep(3000),
     lager:info("checking number of read failures on secondary cluster"),
-    ReadErrors = rt_systest:read(BSecond, 1000, 11000, TestBucket, 2),
+    ReadErrors = rt:systest_read(BSecond, 1000, 11000, TestBucket, 2),
     lager:info("got ~p read failures", [length(ReadErrors)]),
 
     %% ensure node is down before we try to start it up again.
     lager:info("pb_write_during_shutdown: Ensure node ~p is down before restart", [Target]),
     ?assertEqual(ok, rt:wait_until_unpingable(Target)),
 
-    rt_node:start(Target),
+    rt:start(Target),
     rt:wait_until_pingable(Target),
     rt:wait_for_service(Target, riak_repl),
-    ReadErrors2 = rt_systest:read(Target, 1000, 11000, TestBucket, 2),
+    ReadErrors2 = rt:systest_read(Target, 1000, 11000, TestBucket, 2),
     lager:info("got ~p read failures on ~p", [length(ReadErrors2), Target]),
     case length(WriteErrors) >= length(ReadErrors) of
         true ->
@@ -526,13 +526,13 @@ http_write_during_shutdown(Target, BSecond, TestBucket) ->
     ConnInfo = proplists:get_value(Target, rt:connection_info([Target])),
     {IP, Port} = proplists:get_value(http, ConnInfo),
     lager:info("Connecting to http socket ~p:~p on ~p", [IP, Port, Target]),
-    C = rt_http:httpc(Target),
+    C = rt:httpc(Target),
 
     %% do the stop in the background while we're writing keys
     spawn(fun() ->
                 timer:sleep(500),
                 lager:info("Stopping node ~p again", [Target]),
-                rt_node:stop(Target),
+                rt:stop(Target),
                 lager:info("Node stopped")
            end),
 
@@ -557,7 +557,7 @@ http_write_during_shutdown(Target, BSecond, TestBucket) ->
     lager:info("http: write_during_shutdown: Ensure node ~p is down before restart", [Target]),
     ?assertEqual(ok, rt:wait_until_unpingable(Target)),
 
-    rt_node:start(Target),
+    rt:start(Target),
     rt:wait_until_pingable(Target),
     rt:wait_for_service(Target, riak_repl),
     ReadErrors2 = http_read(C, 12000, 22000, TestBucket, 2),
